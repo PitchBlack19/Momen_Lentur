@@ -1,0 +1,219 @@
+#include <HX711.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// Konfigurasi WiFi
+const char* ssid = "LAPTOP-TF5VQK0P 2129";
+const char* password = "12345678";
+const char* scriptUrl = "https://script.google.com/macros/s/AKfycbx3OTDNgw7mjAydU43aogouK7G46vXw0L2RjKv_PgqsIKleibblSgHg16XCMoxJgD5L/exec";
+
+// Pin HX711
+const int LOADCELL_DOUT_PIN = 15;
+const int LOADCELL_SCK_PIN = 4;
+
+// Pin LED
+const int LED_HIJAU_PIN = 12;
+const int LED_MERAH_PIN = 13;
+
+// Pin tombol Tare dan Kirim
+const int TARE_BUTTON_PIN = 2;
+const int SEND_BUTTON_PIN = 14;
+
+HX711 LoadCell;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+float calibration_factor = -8.28 ;
+float lengan_momen = 0.1; // dalam meter
+float gravitasi = 9.81;  // dalam m/s^2
+const float MOMENT_THRESHOLD = 2.0; // dalam Nm
+
+bool lastTareButtonState = HIGH;
+bool lastSendButtonState = HIGH;
+
+float berat_integer = 0;
+float momen_tekuk = 0;
+
+bool wifiConnected = false; // Status WiFi
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin();
+  LoadCell.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+
+  // Tunggu HX711 siap
+  while (!LoadCell.is_ready()) {
+    delay(100); // Tunggu hingga HX711 siap tanpa mencetak pesan
+  }
+
+  // Inisialisasi LCD
+  lcd.begin(16, 2);
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Mengkalibrasi...");
+
+  // Inisialisasi LED
+  pinMode(LED_HIJAU_PIN, OUTPUT);
+  pinMode(LED_MERAH_PIN, OUTPUT);
+
+  // Inisialisasi tombol tare dan tombol kirim
+  pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(SEND_BUTTON_PIN, INPUT_PULLUP);
+
+  // Kalibrasi awal load cell
+  LoadCell.set_scale(15600);
+  LoadCell.tare();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Siap...");
+
+  // Hubungkan ke WiFi pada awal setup
+  connectToWiFi();
+}
+
+void loop() {
+  // Pengukuran momen tekuk
+  measureMoment();
+
+  // Mengecek tombol kirim
+  bool currentSendButtonState = digitalRead(SEND_BUTTON_PIN);
+  if (lastSendButtonState == HIGH && currentSendButtonState == LOW) {
+    if (berat_integer > 0) { // Validasi berat sebelum mengirim
+      sendDataToGoogleSheets();
+    } else {
+      Serial.println("Berat tidak valid, data tidak dikirim.");
+      lcd.clear();
+      lcd.print("Berat Tidak Valid");
+    }
+  }
+  lastSendButtonState = currentSendButtonState;
+
+  // Mengatur faktor kalibrasi melalui input serial
+  if (Serial.available() > 0) {
+    char temp = Serial.read();
+    if (temp == 'a') {
+      calibration_factor += 0.05; // Tambah faktor kalibrasi
+      Serial.print("Faktor Kalibrasi: ");
+      Serial.println(calibration_factor);
+    } else if (temp == 'z') {
+      calibration_factor -= 0.05; // Kurangi faktor kalibrasi
+      Serial.print("Faktor Kalibrasi: ");
+      Serial.println(calibration_factor);
+    }
+    // Menjalankan tare secara manual
+    else if (temp == 't') {
+      LoadCell.tare();
+      Serial.println("Tare selesai, titik nol diatur.");
+    }
+  }
+
+  // Cek kembali koneksi WiFi jika WiFi menjadi tersedia
+  if (!wifiConnected && WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("WiFi tersambung kembali.");
+    lcd.clear();
+    lcd.print("WiFi Tersambung");
+  }
+}
+
+void connectToWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Menghubungkan ke WiFi");
+
+  unsigned long startAttemptTime = millis();
+  const unsigned long timeout = 20000; // 20 detik
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < timeout) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Terhubung.");
+    lcd.clear();
+    lcd.print("WiFi Terhubung");
+    wifiConnected = true;
+  } else {
+    Serial.println("\nTidak dapat terhubung ke WiFi.");
+    lcd.clear();
+    lcd.print("WiFi Gagal");
+    wifiConnected = false;
+  }
+}
+
+void measureMoment() {
+  if (LoadCell.is_ready()) {
+    float berat = LoadCell.get_units(10) * calibration_factor;
+    berat_integer = abs(berat) -18; // Kurangi 18 dari berat_integer
+    if (berat_integer < 0) berat_integer = 0; // Pastikan berat_integer tidak negatif
+    float gaya = berat_integer * 0.001 * gravitasi; // gram ke kilogram dan dikalikan dengan gaya gravitasi
+    momen_tekuk = gaya * lengan_momen;
+
+    // Tampilkan data berat dan momen
+    Serial.print("Berat: ");
+    Serial.print(berat_integer);
+    Serial.print(" gram, Momen: ");
+    Serial.print(momen_tekuk, 3);
+    Serial.println(" Nm");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Momen: ");
+    lcd.print(momen_tekuk, 3);
+    lcd.print(" Nm");
+
+    // Kontrol LED berdasarkan momen tekuk
+    if (momen_tekuk > MOMENT_THRESHOLD) {
+      digitalWrite(LED_HIJAU_PIN, LOW);
+      digitalWrite(LED_MERAH_PIN, HIGH);
+    } else {
+      digitalWrite(LED_HIJAU_PIN, HIGH);
+      digitalWrite(LED_MERAH_PIN, LOW);
+    }
+  }
+
+  // Mengecek tombol tare
+  bool currentTareButtonState = digitalRead(TARE_BUTTON_PIN);
+  if (lastTareButtonState == HIGH && currentTareButtonState == LOW) {
+    Serial.println("Tare dilakukan.");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Tare...");
+    LoadCell.tare();
+    delay(100);
+  }
+  lastTareButtonState = currentTareButtonState;
+}
+
+void sendDataToGoogleSheets() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    http.setTimeout(10000); // Timeout selama 10 detik
+    http.begin(scriptUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    String jsonData = "{\"Berat\":" + String(berat_integer) + ",\"momen\":" + String(momen_tekuk, 3) + "}";
+    Serial.println("JSON data: " + jsonData);
+
+    int httpResponseCode = http.POST(jsonData);
+    Serial.println("HTTP Response Code: " + String(httpResponseCode));
+
+    if (httpResponseCode > 0) {
+      Serial.println("Data terkirim.");
+      lcd.clear();
+      lcd.print("Data Terkirim");
+    } else {
+      Serial.println("Gagal mengirim data.");
+      String response = http.getString();
+      Serial.println("Server response: " + response);
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi tidak terhubung!");
+    lcd.clear();
+    lcd.print("WiFi tidak konek!");
+  }
+}
